@@ -219,11 +219,157 @@ kubectl auth can-i create pods -n learn-k8s
 - Enforced at **admission**, so `kubectl auth can-i create pods` = yes (RBAC) but pod still rejected if it violates the SCC bound to its ServiceAccount.
 - Classic error: `unable to validate against any security context constraint`. #1 reason a "valid" pod won't start on OpenShift. Default restrictive SCC = `restricted-v2`.
 
+### OIDC / cluster authentication (verified: Azure AD)
+- **AuthN delegates to an external IdP** via OpenID Connect (OIDC on top of OAuth2). This cluster federates to **Azure AD**.
+- **Flow:** `oc login` → OpenShift OAuth server redirects to Azure AD (issuer) → you auth (SSO+MFA) → Azure returns a **signed JWT** with your identity claims → OAuth server validates the JWT signature against Azure's public keys (**JWKS** from issuer's `/.well-known/openid-configuration`) → maps claims → username → RBAC authorizes.
+- **API server never sees your password** — only trusts the IdP-signed token. Stateless (signature + expiry check, no etcd/session lookup). Tokens short-lived + refreshed.
+- **This cluster's config decoded:**
+  ```yaml
+  identityProviders:
+  - name: Azure_AD
+    type: OpenID
+    mappingMethod: claim              # create/link OpenShift User by preferred username; fail on collision
+    openID:
+      clientID: 174845ca-...          # THIS CLUSTER's app registration in Azure AD
+      clientSecret: {name: azure-ad-client-secret}  # cluster's OAuth app password (K8s Secret)
+      issuer: https://login.microsoftonline.com/<tenant-id>/v2.0   # tenant-id GUID = Ford Azure tenant; ROOT OF TRUST
+      extraScopes: [email, profile]   # request extra claims
+      claims:
+        preferredUsername: [upn]      # username = upn (e.g. psupraja@ford.com)
+        email: [email]
+        name: [name]
+  ```
+- **mappingMethod:** `claim` (auto-create User, fail on name collision) | `lookup` (link pre-existing only) | `add` (link multiple IdPs to one User) | `generate` (unique name on collision).
+- ⚠️ **This config maps identity, NOT groups** — no `groups` claim → RBAC must bind to individual `upn`s. To use Azure groups in RBAC, add a groups claim + group sync.
+- **clientSecret** = proves cluster is the legit OAuth app to Azure; leaking it = impersonate the cluster app. Stored as a Secret.
+- **OIDC token (humans) vs ServiceAccount token (pods):** OIDC from external IdP w/ email+groups, short-lived; SA token issued by cluster w/ SA name+ns, projected/auto-rotated.
+```bash
+oc whoami ; oc whoami --show-groups ; oc get user ; oc get identity
+kubectl get oauth cluster -o yaml | grep -A20 identityProviders
+```
+> Soundbite: "The cluster federates auth to Azure AD via OIDC: OpenShift's OAuth server is a registered app (clientID+secret) trusting our tenant's issuer. On login you auth at Azure, which returns a signed JWT; OpenShift validates it against Azure's JWKS and maps the upn claim to the username via mappingMethod: claim. It maps identity but not groups, so RBAC binds to individual users. The API server never sees a password — it just trusts the signed token."
+
+### RBAC + multi-tenancy (governing a shared platform)
+- **RBAC = verb + resource + (namespace)**, granted via `Role`/`ClusterRole` bound by `RoleBinding`/`ClusterRoleBinding`. Purely additive (no deny rules); default deny.
+  - `Role`/`RoleBinding` = namespaced; `ClusterRole`/`ClusterRoleBinding` = cluster-wide. (A ClusterRole can also be bound *into* one namespace via a RoleBinding.)
+- ⭐ **Aggregated ClusterRoles** (the differentiator most miss): built-in `admin`/`edit`/`view` are NOT hand-maintained — they carry an **`aggregationRule`** (label selector). Any ClusterRole labeled to match is **auto-merged** in. CRD authors extend built-in roles WITHOUT editing them: create a small ClusterRole with rules for your CRD (e.g. `rollouts.argoproj.io`), label it `rbac.authorization.k8s.io/aggregate-to-admin: "true"` → it folds into `admin` automatically. Decentralized RBAC extension.
+- **The multi-tenancy synthesis — 3 orthogonal mechanisms stack:**
+  | Mechanism | Governs | Examples |
+  |-----------|---------|----------|
+  | **RBAC** | **WHO** can act (identity+verb+resource) | Role/ClusterRole bindings |
+  | **Admission control** | **WHAT KIND** of object they can create (privileged? root? unsigned image?) | SCC, Kyverno, PodSecurity |
+  | **ResourceQuota / LimitRange** | **HOW MUCH** they can consume (cpu/mem/object counts) | per-namespace quotas |
+- Interview: "Governing a shared cluster is three orthogonal layers — RBAC (who), admission (what kind), quota (how much)."
+- **ResourceQuota vs LimitRange:** **ResourceQuota** caps **aggregate** consumption **per namespace** (total cpu/mem, object counts) and rejects anything that would exceed it. **LimitRange** operates one level down — **injects default requests/limits per container** (so Quota doesn't reject pods that forgot to set them) and bounds min/max per container. Together = native **capacity accounting** under policy engines (Kyverno = compliance, not accounting).
+```bash
+kubectl get clusterrole admin -o jsonpath='{.aggregationRule}{"\n"}'   # see the aggregation selector
+kubectl auth can-i --list -n learn-k8s                                   # my effective permissions
+kubectl get resourcequota,limitrange -A | head
+```
+
+### Workload Identity Federation (pods → cloud APIs, no stored keys)
+- **Problem:** pods calling cloud APIs (GCS/Secret Manager) used to mount a **long-lived cloud SA key** (never expires, leaks into etcd/git). WIF eliminates the stored key.
+- ⭐ **The mirror of user OIDC:** the **Kubernetes API server IS an OIDC issuer** — it signs short-lived ServiceAccount JWTs + publishes JWKS. You register that issuer as a **trusted IdP in the cloud**.
+  - User login: cloud IdP (Azure) → cluster trusts it.
+  - Workload identity: **cluster (IdP) → cloud trusts it**.
+- **Token-exchange flow:**
+  ```
+  1. Pod has a PROJECTED SA token (cluster-signed JWT, ~1h, auto-rotated, audience = cloud STS)
+  2. Pod → cloud STS: "here's my K8s JWT, give me creds"
+  3. Cloud validates: signature vs cluster's JWKS + issuer/aud/expiry + SA↔IAM-role mapping
+  4. STS returns SHORT-LIVED cloud creds (~1h)
+  5. Pod calls the bucket — NO long-lived key anywhere
+  ```
+- **`pod-identity-webhook`** (seen in webhook list) = MUTATING webhook that injects the projected token volume + env vars (STS audience, role) → cloud SDK "just works". Same mechanism as Istio/OTel injection.
+- **Cloud names:** AWS = **IRSA** (SA annotation `eks.amazonaws.com/role-arn`); GCP = **Workload Identity / WIF**; Azure = **AAD Workload Identity**.
+
+#### GCP side — the bindings ("adding a member")
+**Step 1 — trust binding:** add the K8s SA as a **member** on a GCP service account (GSA) with role **`roles/iam.workloadIdentityUser`** ("this KSA may impersonate this GSA"):
+```bash
+gcloud iam service-accounts add-iam-policy-binding MY-GSA@PROJECT.iam.gserviceaccount.com \
+  --role roles/iam.workloadIdentityUser --member "<principal>"
+```
+Member format: GKE = `serviceAccount:PROJECT.svc.id.goog[NS/KSA]`; **Federation (non-GKE/OpenShift)** = `principalSet://iam.googleapis.com/projects/NUM/locations/global/workloadIdentityPools/POOL/attribute.sub/system:serviceaccount:NS:KSA`.
+**Step 2 — real perms:** grant the GSA resource roles (e.g. `roles/storage.objectViewer`).
+**Step 3 — K8s side:** annotate the KSA (GKE: `iam.gke.io/gcp-service-account: MY-GSA@...`).
+**Non-GKE prereq:** create a **Workload Identity Pool + OIDC provider** whose `--issuer-uri` = the cluster's `serviceAccountIssuer` → registers the cluster's issuer as trusted.
+
+- **Trust chain:** K8s SA (annotation→GSA) → pod token → cloud STS validates vs cluster JWKS + SA↔role member binding → short-lived creds → resource.
+- **Why better:** no long-lived secrets, short-lived+auto-rotated, least-privilege per SA, auditable.
+```bash
+kubectl get authentication cluster -o jsonpath='{.spec.serviceAccountIssuer}{"\n"}'   # what the cloud trusts
+kubectl get mutatingwebhookconfigurations | grep -i identity
+kubectl get --raw /.well-known/openid-configuration | head    # OIDC discovery the cloud fetches
+```
+> Soundbite: "Workload Identity Federation lets pods call cloud APIs with no stored credentials. The API server is an OIDC issuer signing short-lived SA tokens; you register it as a trusted IdP in the cloud. On GCP you add the K8s ServiceAccount as an IAM member on a GCP service account with roles/iam.workloadIdentityUser (the trust binding) and give that GSA the real permissions; for non-GKE you also create a workload identity pool + OIDC provider pointing at the cluster's issuer. The pod exchanges its cluster-signed token at the cloud STS for short-lived creds. It's the mirror of user OIDC — cluster is the IdP, cloud is the relying party. AWS calls it IRSA."
+
+#### Real WIF config seen in a pod (`external_account` ADC)
+Pod init script builds GCP's Application Default Credentials file (only if creds not already set):
+```json
+{
+  "type": "external_account",                 // WIF, NOT a SA key
+  "audience": "<GCP_WIF_AUDIENCE>",           // the workload identity pool/provider
+  "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+  "credential_source": { "file": "/var/run/secrets/openshift/serviceaccount/token" },  // PROJECTED cluster-signed SA token
+  "token_url": "https://sts.googleapis.com/v1/token",   // GCP STS token EXCHANGE
+  "service_account_impersonation_url":
+    "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/<GSA>:generateAccessToken"
+}
+```
+Then `export GOOGLE_APPLICATION_CREDENTIALS=<file>` → Google SDK auto-discovers + exchanges transparently.
+**Two-hop flow this encodes:**
+```
+1. SDK reads projected SA token (/var/run/secrets/openshift/serviceaccount/token)
+2. POST to sts.googleapis.com/v1/token → FEDERATED token (GCP validates vs pool audience + cluster JWKS)
+3. service_account_impersonation_url (generateAccessToken) → IMPERSONATE the GSA → short-lived GSA access token
+4. call GCP APIs (GCS, etc.)
+```
+= token → federated token → impersonate GSA → access token. `type:external_account` = the tell-tale sign of WIF (vs a static key). No long-lived secret anywhere.
+
+#### ⭐ The universal trust triple: issuer + subject + audience
+| Coordinate | Meaning | Where used |
+|-----------|---------|-----------|
+| **issuer** (`iss`) | "who signed the token" = cluster's `serviceAccountIssuer` URL | **REGISTRATION** (GCP pool `--issuer-uri`, Azure federated cred Issuer, AWS OIDC provider, FOSSA/CI). Relying party fetches JWKS from `<issuer>/.well-known/openid-configuration`. |
+| **subject** (`sub`) | "which identity" = `system:serviceaccount:<ns>:<sa>` | the mapping key (member binding) |
+| **audience** (`aud`) | "for whom" = the pool/app/API | RUNTIME (in the token + external_account config) |
+- Pod runtime config only carries **audience + token file**; the **issuer** is inside the token's `iss` claim and was registered ONCE on the relying party. Audience = indirection referencing that pre-set trust.
+- **Same triple everywhere:** Azure federated credential = {Issuer=cluster URL, Subject=system:serviceaccount:ns:sa, Audience=api://AzureADTokenExchange}; GCP pool/member; AWS IRSA OIDC provider; FOSSA/API-catalog/CI OIDC.
+- **Real GCP binding (Terraform, verified):**
+  ```hcl
+  resource "google_service_account_iam_member" "tekton_wif" {
+    service_account_id = google_service_account.gsa_tekton_service.id   # GSA to impersonate
+    role   = "roles/iam.workloadIdentityUser"                          # trust/impersonation role
+    member = "principal://iam.googleapis.com/projects/110453944286/locations/global/workloadIdentityPools/openshift-pool/subject/system:serviceaccount:openshift-ford-artifacthub:artifacthub"
+  }
+  ```
+  - `workloadIdentityPools/openshift-pool` = the pool (registered with cluster issuer-uri at setup).
+  - `subject/system:serviceaccount:<ns>:<sa>` = the SUBJECT (token `sub`) → binds ONE specific KSA.
+  - `principal://.../subject/<KSA>` = single SA; `principalSet://.../attribute.../` = a group of SAs.
+> Triple soundbite: "Workload identity trust is always three coordinates: issuer (who signs = the cluster's OIDC issuer URL, used at registration), subject (which ServiceAccount = system:serviceaccount:ns:sa), and audience (for whom = the pool/app). The pod only carries a token + audience at runtime; the issuer is registered once on the relying party — Azure federated credential, GCP workload identity pool, AWS OIDC provider, or FOSSA."
+
+#### How WIF is ENABLED on an OpenShift cluster (CCO + ccoctl)
+- **There IS a serviceAccountIssuer** — it must be a **PUBLIC OIDC issuer** (so GCP can fetch the JWKS). On OpenShift-GCP-WIF it's usually a **public GCS bucket**: `https://storage.googleapis.com/<bucket>` hosting `/.well-known/openid-configuration` + `/keys` (JWKS). Bound SA tokens carry `iss` = that URL; the WIF pool provider's `--issuer-uri` = that URL. (Not the internal `api.sb0120...`.)
+- **Engine = Cloud Credential Operator (CCO)** in **Manual + short-lived (WIF) mode** — set at INSTALL time (`credentialsMode: Manual` in install-config; can't easily flip on a running cluster).
+- **`ccoctl gcp create-all`** automates the GCP side: creates the **public GCS bucket** (→ becomes the issuer URL), the **Workload Identity Pool + OIDC provider** (`issuer-uri`=bucket), the **GSAs + iam.workloadIdentityUser bindings** (the Terraform members), and the **external_account Secret manifests**.
+- **CredentialsRequest** CRs (from each operator needing cloud access) → CCO fulfills them → creates the `external_account` Secret (projected token + STS + GSA impersonation URL — the pod config seen).
+- `Authentication` CR `.spec.serviceAccountIssuer` = the public bucket URL → bound SA tokens signed with `iss` = that.
+```bash
+kubectl get authentication cluster -o jsonpath='{.spec.serviceAccountIssuer}{"\n"}'   # public GCS bucket?
+kubectl get cloudcredential cluster -o jsonpath='{.spec.credentialsMode}{"\n"}'        # Manual?
+kubectl get credentialsrequests -A | head ; kubectl -n openshift-cloud-credential-operator get pods
+```
+> Enable soundbite: "GCP WIF on OpenShift needs a PUBLIC issuer — usually a GCS bucket hosting the JWKS — set as the serviceAccountIssuer. You install with credentialsMode: Manual so the Cloud Credential Operator runs in WIF mode, then ccoctl builds the bucket/issuer, the workload identity pool+provider, the GSAs + iam.workloadIdentityUser bindings, and the external_account secrets. Each operator's CredentialsRequest is fulfilled by CCO with a short-lived external_account credential."
+
 ### Kubernetes extensibility (the 3 mechanisms) — cluster is a living example
 1. **CRDs** — define new object types (e.g. CNPG `Cluster`, Tekton `Pipeline`, Knative `Service`).
 2. **Admission webhooks** — intercept requests at stages 4/6 (Kyverno policy, StackRox/ACS security, OTel sidecar injection, pod-identity token injection, Multus multi-NIC, Kata config).
 3. **Controllers/Operators** — reconcile the CRs (same LIST+WATCH loop as core controllers).
 > Interview: "How is K8s extensible?" → CRDs (new types) + admission webhooks (intercept) + operators (reconcile). All plug into the SAME api-server pipeline.
+
+### Policy engines: OPA Gatekeeper vs Kyverno (admission)
+- **OPA** (Open Policy Agent) = general policy engine, **Rego** language. **Gatekeeper** = OPA as a K8s **validating (+mutating) admission webhook** (CRDs: **ConstraintTemplate** = Rego rule, **Constraint** = instance).
+- Enforces at admission (stage 6): "images only from registry.ford.com", "require labels", "no privileged". Rejects non-compliant objects.
+- **Gatekeeper (Rego) vs Kyverno (YAML):** same job (policy-as-admission), different language. This cluster uses **Kyverno**. Both = CRD + webhook + operator.
 
 ### How operators get installed — OLM (Operator Lifecycle Manager)
 **Two layers:** (1) OLM installs the OPERATOR; (2) the operator installs the APP.
@@ -605,6 +751,33 @@ spec: { podSelector: {matchLabels: {app: web}}, policyTypes: [Ingress],
 ```
 > Soundbite: "NetworkPolicy is a whitelist firewall enforced by the CNI. Pods are open by default; once any policy selects a pod for a direction, it's deny-all except your explicit allow rules. OVN/Calico/Cilium enforce it; Flannel ignores it."
 
+### Cluster networking setup: primary/secondary IPs (3 senses)
+**IPAM / hostPrefix (verified):** `clusterNetwork: 172.24.0.0/14, hostPrefix:24` → the pod pool is subdivided into a **`/24` per node** (each node owns 254 pod IPs). OVN allocates each pod an IP only from its node's /24. Third octet differs by node (web pods on .15/.0/.21 = different nodes). Math: `/14 ÷ /24 = 1024 nodes max`, 254 pods/node. Per-node blocks → efficient routing (route to `172.24.15.0/24` = node C; no per-pod routes). serviceNetwork `172.30.0.0/16`.
+- Verified: only Multus NAD = `default` (primary OVN net) → **no custom secondary networks in use**. **No EgressIP configured** (el feature available but unused).
+
+**1. Node primary IP vs GCP alias/secondary ranges:**
+- Node **primary IP** = VM NIC = `10.0.145.x` (real GCP subnet IP, shown as INTERNAL-IP).
+- **Alias/secondary ranges** = GCP feature where a subnet range is assigned to a VM NIC. **GKE** uses these for native pod IPs. **BUT this cluster (OVN-K8s)** uses an **OVERLAY** (Geneve tunnels), NOT GCP alias IPs → pod/service IPs (172.24/172.30) are encapsulated inside node-to-node traffic; GCP only sees node primary IPs on the wire.
+
+**2. Pod primary network vs Multus secondary networks:**
+- **Primary** = default OVN interface `eth0` (the 172.24.x pod IP).
+- **Multus** (saw `multus.openshift.io` webhook) = meta-CNI enabling **multiple NICs per pod**. Secondary networks attached via **`NetworkAttachmentDefinition`** CRs + pod annotation `k8s.v1.cni.cncf.io/networks`. Use: telco/NFV, SR-IOV/macvlan isolated data planes.
+  ```
+  normal pod: eth0 (OVN primary)
+  multus pod: eth0 (OVN) + net1 (secondary, e.g. SR-IOV)
+  ```
+
+**3. Egress IP (the `el` egress-lane nodes):**
+- **EgressIP** = OpenShift feature assigning a stable **source IP** to specific nodes for pod→external traffic, so external firewalls can allowlist a fixed IP. The `el` (edge/egress-lane) nodes host these.
+
+```bash
+kubectl get network.config cluster -o jsonpath='{.spec.clusterNetwork}{"\n"}{.spec.serviceNetwork}{"\n"}'
+kubectl get nodes -o wide | awk '{print $1, $6}'          # node primary IPs
+kubectl get network-attachment-definitions -A             # Multus secondary nets
+kubectl get egressip -A 2>/dev/null                        # egress IPs (el nodes)
+```
+> Soundbite: "Node primary IPs are real GCP subnet addresses; pod/service IPs here are an OVN overlay (Geneve), not GCP alias ranges like GKE uses. Pods have one primary OVN NIC but can get secondary NICs via Multus NetworkAttachmentDefinitions. Egress IP pins a stable source IP on the egress-lane nodes for external allowlisting."
+
 ---
 
 ## Lesson — Observability
@@ -651,7 +824,7 @@ spec: { podSelector: {matchLabels: {app: web}}, policyTypes: [Ingress],
 | Pod | Role |
 |-----|------|
 | `prometheus-k8s-0/1` | Scraper + **TSDB** (time-series DB). 2 replicas = HA, each scrapes independently. |
-| `prometheus-operator` | Reconciles **ServiceMonitor/PodMonitor** CRs → Prometheus scrape config. |
+| `prometheus-operator` | Reconciles **ServiceMonitor/PodMonitor** CRs → Prometheus scrape config. | 
 | `prometheus-operator-admission-webhook` | Validates PrometheusRule/monitor CRs at admission. |
 | `node-exporter` (DaemonSet, 1/node) | **HOST/OS** metrics: CPU/mem/disk/net from `/proc`,`/sys`. |
 | `kube-state-metrics` | **K8s OBJECT** metrics (replicas, pod phase, deploy status) via LIST+WATCH. |
@@ -810,11 +983,52 @@ kubectl -n learn-k8s describe pod stuck | grep -A10 Events   # "0/16 nodes avail
 - **OOMKill vs eviction:** container exceeds its mem LIMIT → kernel **OOM-kills just that container** (`OOMKilled`). NODE low overall → kubelet **evicts whole pods** by QoS.
 - (web pods = BestEffort — no requests/limits set.)
 
+### cgroups mechanics (kernel enforcement of requests/limits)
+- **cgroups** = Linux kernel feature limiting/accounting resources. Kubelet **translates requests/limits → cgroup files**; the **kernel** enforces.
+- ⭐ **CPU = compressible → THROTTLED; Memory = incompressible → OOM-KILLED.** (The key asymmetry.)
+- **CPU:**
+  | Setting | cgroup v2 file | Effect |
+  |---------|---------------|--------|
+  | `requests.cpu` | `cpu.weight` (v1 `cpu.shares`) | RELATIVE weight, only under contention. Doesn't cap. |
+  | `limits.cpu` | `cpu.max` (v1 `cpu.cfs_quota_us`/`period`) | CFS quota-per-period. Exceed → **throttle** (paused till next period, default 100ms). |
+  - `cpu.max` format = `<quota> <period>`µs. `max 100000` = **no limit** (period 100ms). `50000 100000` = 0.5 core.
+  - Aggressive CPU limits → **latency spikes** (throttled mid-request). Metric: `container_cpu_cfs_throttled_periods_total`.
+- **Memory:**
+  | Setting | cgroup v2 file | Effect |
+  |---------|---------------|--------|
+  | `requests.memory` | (scheduling + oom priority) | not a hard cap |
+  | `limits.memory` | `memory.max` (v1 `memory.limit_in_bytes`) | hard cap → **OOM killer** → container dies **exit 137** (`OOMKilled`). No throttle. |
+- ⭐ **QoS → kernel via `oom_score_adj`** (this IS the eviction order): Guaranteed **-998** (killed last) · Burstable 2–999 · BestEffort **1000** (killed first). Node OOM → kernel picks victim by this.
+  - Container over ITS limit → cgroup OOM (that container only). NODE OOM → node-level, by oom_score_adj.
+- **Hierarchy (verified live, cgroup v2 / systemd slices):**
+  ```
+  /sys/fs/cgroup/kubepods.slice/
+    ├── kubepods-pod<uid>.slice/       ← Guaranteed pods sit directly here
+    ├── kubepods-burstable.slice/pod<uid>.slice/crio-<ctr>.scope/  ← cpu.max, memory.max
+    └── kubepods-besteffort.slice/...
+  ```
+  Each level caps the sum of children (container→pod→QoS→node).
+- **v1 vs v2:** v1 = separate hierarchy per controller (`cpu.cfs_quota_us`, `memory.limit_in_bytes`); **v2 = unified hierarchy** (`cpu.max`, `memory.max`) — **RHCOS/OpenShift 4.x = v2** (confirmed: `cpu.max`/`memory.max` at cgroup root).
+- **Verified live** (`oc debug node` → `chroot /host` → `/sys/fs/cgroup/kubepods.slice`): saw `kubepods-burstable.slice`, `kubepods-besteffort.slice`, `cpu.weight`, `cpu.max = max 100000` (unlimited, 100ms period), `memory.max`. Also: `oc debug node` pod is **hostNetwork** → its "Pod IP" = the NODE IP (`10.0.145.28`) — same rule as the IP decoder.
+```bash
+# oc debug node/<n> → chroot /host
+#   cat /sys/fs/cgroup/kubepods.slice/.../cpu.max     # "<quota> <period>" or "max <period>"
+#   cat /sys/fs/cgroup/kubepods.slice/.../memory.max
+kubectl get --raw /metrics | grep container_cpu_cfs_throttled | head   # CPU throttling (latency smoking gun)
+```
+> Soundbite: "K8s translates requests/limits into cgroup files the kernel enforces. requests.cpu → cpu.weight (relative, contention only); limits.cpu → cpu.max CFS quota, so over-limit **throttles** (CPU is compressible). limits.memory → memory.max hard cap, so over-limit triggers the **OOM killer**, exit 137 (memory is incompressible). QoS is implemented as oom_score_adj — BestEffort=1000 killed first, Guaranteed=-998 last — so the kernel's OOM victim selection IS the QoS eviction order. Modern nodes use cgroup v2's unified hierarchy under kubepods.slice."
+
 ### PodDisruptionBudget (PDB)
 - "Keep ≥ N (or X%) pods available." Blocks **VOLUNTARY** disruptions (drain, upgrade) that would drop below budget.
 - Voluntary (drain/upgrade) → PDB **respected** (eviction API refuses until replacement Ready).
 - Involuntary (node crash, OOM) → PDB **can't help** (hardware doesn't ask permission).
 - The `etcd-guard`/`apiserver-guard` pods enforce PDB-like control-plane safety.
+
+### Cordon vs Drain (node maintenance)
+- **`kubectl cordon`** = just flips the node to **unschedulable** (`.spec.unschedulable`). **Running pods untouched** — only stops NEW pods landing.
+- **`kubectl drain`** = **cordon first**, THEN evicts every pod via the **Eviction API** (not raw delete) → **respects PDBs** (blocks rather than violating). Pods go through the **graceful shutdown** sequence; their controller reschedules replacements elsewhere.
+- ⚠️ **DaemonSet pods** (`--ignore-daemonsets`) and **emptyDir data** (`--delete-emptydir-data`) need explicit flags — drain won't silently discard either.
+- This is what a **Machine delete / MCO node update** does under the hood (drain → PDB-safe → terminate).
 
 ### Graceful shutdown (pod termination sequence)
 ```
@@ -839,6 +1053,37 @@ kubectl -n openshift-monitoring get pod prometheus-k8s-0 -o yaml | grep -A6 -iE 
 > pressure — BestEffort dies first. A PDB protects availability during voluntary disruptions like
 > drains but can't help an involuntary node crash. On termination the pod leaves endpoints, runs
 > preStop, gets SIGTERM, then SIGKILL after the grace period — so apps should handle SIGTERM."
+
+---
+
+## Lesson — Workload Controllers (StatefulSet / DaemonSet / Job / CronJob)
+
+### StatefulSet — identity that survives rescheduling
+- Deployment/ReplicaSet pods = interchangeable **cattle**; StatefulSet pods = individually named + **stay** that way.
+- **Ordinal naming**: `web-0`, `web-1`, `web-2` (stable, predictable — not a random suffix).
+- **Requires a headless Service** (`clusterIP: None`) → each pod gets a stable DNS record `<pod>.<svc>.<ns>.svc.cluster.local` → `web-0` reachable at the same name after reschedule.
+- **Ordered lifecycle**: start `0→1→2` sequentially (web-1 waits for web-0 Running+Ready); scale down in **reverse** (highest first). Opt out with `podManagementPolicy: Parallel`.
+- ⭐ **Stable storage (the real reason it exists)**: `volumeClaimTemplates` → each ordinal gets its own PVC (`data-web-0`...). **PVC is NOT deleted with the pod** → reschedule web-1 to another node → reattaches the SAME PVC (same identity + data). Kafka/Elasticsearch/DB need this; a Deployment can't.
+- **Rolling update partition**: `updateStrategy.rollingUpdate.partition: N` → only ordinals ≥ N update; below stay old. Manual canary for stateful (can't shift traffic % like stateless).
+- Graceful shutdown sequence applies **per pod, in order** (web-2 fully terminates before web-1 starts).
+
+### DaemonSet — exactly one pod per node, automatically
+- One copy per node; new node joins → controller schedules a copy (zero action); node leaves → pod GC'd. (node-exporter, ovnkube-node, Vector are DaemonSets.)
+- ⚠️ **Misconception:** DaemonSet pods do NOT bypass the scheduler (true only pre-1.17). Since 1.17 they go through the **normal scheduler** — the controller auto-injects a **NodeAffinity** pinning to the target node + **tolerations** for standard taints (which is WHY node-exporter runs on masters despite `NoSchedule`).
+
+### Job — run to completion
+- `.spec.completions` (total successes needed) · `.spec.parallelism` (concurrent) · `.spec.backoffLimit` (default 6, retries w/ exponential backoff).
+- Patterns: single (`completions:1`), fixed count (`completions:N` + parallelism), work-queue (completions unset, external coordination).
+- **`podFailurePolicy`** = precise replacement for blunt retry counter: per exit-code behavior (`FailJob`/`Ignore`/`Count`). (Newer → shows currency.)
+- ⭐ **`ttlSecondsAfterFinished`** = auto-GC the Job N sec after finish → automates the completed-Job etcd-bloat cleanup (vs manual `kubectl delete jobs --field-selector=status.successful=1`).
+
+### CronJob
+- Creates Jobs on a schedule. `concurrencyPolicy` (`Allow`/`Forbid`/`Replace`) governs overlaps. `successfulJobsHistoryLimit`/`failedJobsHistoryLimit` cap old Job objects (same etcd-bloat instinct).
+
+### EKS/OpenShift translation
+- None — StatefulSet/DaemonSet/Job/CronJob are **core, unforked** K8s API objects. Identical on EKS.
+
+> Soundbite: "StatefulSets give pods stable identity and storage that survives rescheduling — ordinal naming, a headless Service, and per-pod PVCs that aren't deleted with the pod — for anything stateful that must reattach to itself (Kafka, ES, DBs). DaemonSets place one pod per node through the normal scheduler with an injected node affinity + taint tolerations, not a scheduler bypass. Jobs run to completion with a backoffLimit or the newer podFailurePolicy for exit-code control, and ttlSecondsAfterFinished handles cleanup that'd otherwise bloat etcd."
 
 ---
 
@@ -891,3 +1136,89 @@ kubectl get runtimeclass                            # kata etc.
 > set up networking and assign the pod IP, and CSI to mount volumes. Each pod gets a pause sandbox
 > container that holds the network namespace, so all containers share one pod IP that survives
 > container restarts."
+
+### runc + the runtime stack
+- **runc** = low-level **OCI runtime** that actually MAKES the container: `clone()/unshare()` (namespaces), write cgroup files, apply seccomp/caps, `pivot_root`, `execve` → then **exits** (`conmon` babysits). Not a daemon.
+- Stack: `kubelet → CRI-O (high-level: CRI API, images, pods) → runc (low-level: syscalls) → KERNEL`.
+- Alternatives: **crun** (C, faster, OpenShift modern default), **kata-runtime** (real VM — your kata nodes), **runsc/gVisor** (userspace kernel sandbox).
+
+### ⭐ Userspace vs Kernel (who does what)
+- **Userspace = orchestration/decisions:** kubelet, CRI-O, runc, CNI plugin (ovnkube). **Kernel = enforcement/isolation:** namespaces, cgroups, veth, iptables/OVS, seccomp, overlayfs.
+- **A container = a normal process + kernel namespaces (isolation) + cgroups (limits) + security (seccomp/caps/SELinux).** No "container" object in the kernel — userspace composes kernel primitives.
+- **Pod start:** runc makes syscalls → kernel creates namespaces + writes cgroups + seccomp; CNI (ovnkube) uses **netlink** → kernel creates **veth**, moves it into the pod netns, assigns the **pod IP**, programs routes/OVS flows.
+- So CNI IP assignment: the plugin (userspace) *decides* the IP + *calls* the kernel; the IP lives in the **kernel's** net stack.
+
+### systemd (node init + cgroup driver)
+- **systemd** = node's init (PID 1). Runs **kubelet.service** + **crio.service** (RHCOS is systemd-based).
+- ⭐ **Cgroup driver:** K8s uses `cgroupDriver: systemd` → systemd OWNS the cgroup tree → that's the **`.slice`/`.scope`** naming you saw (`kubepods.slice`, `kubepods-burstable.slice`, `crio-<id>.scope`). kubelet + runtime MUST use the same driver.
+> Node runtime soundbite: "systemd (PID 1) runs the kubelet and CRI-O as services and is the cgroup driver, so the hierarchy is systemd slices/scopes. kubelet→CRI-O→runc: runc is the low-level OCI runtime that makes syscalls to create namespaces + cgroups then execs. All of kubelet/CRI-O/runc/CNI are userspace — they program kernel primitives (namespaces, cgroups, veth, iptables); the kernel does the actual isolation and IP."
+
+---
+
+## Lesson — How OpenShift is built on GCP (day-0)
+
+### IPI vs UPI
+| Model | Who builds cloud infra (VPC/VMs/LBs)? |
+|-------|----------------------------------------|
+| **IPI** (Installer-Provisioned) | the `openshift-install` installer — fully automated (this cluster) |
+| **UPI** (User-Provisioned) | you (Terraform), installer just deploys OpenShift onto it |
+
+### Install flow (`openshift-install create cluster`)
+1. Reads **`install-config.yaml`** (region, node counts, machine types, base domain, GCP project, pull secret).
+2. Generates **Ignition** configs (RHCOS first-boot config) per role: bootstrap/master/worker.
+3. Calls **GCP API** → creates VPC, subnets (10.0.144.0/x node net), firewall rules (6443 API, 22623 machine-config), Cloud LBs (API + ingress), Cloud DNS (`api.sb0120...` → LB), IAM service accounts, VM instances.
+4. **Bootstrap process** → destroys bootstrap → operators finish config.
+
+### Bootstrap (chicken-and-egg solve)
+```
+1. Bootstrap VM boots → TEMPORARY standalone control plane (etcd+apiserver hosting assets)
+2. 3 master VMs boot → pull config FROM bootstrap
+3. Masters form the REAL etcd + control plane (the STATIC PODS from Lesson 1)
+4. Masters healthy → bootstrap node DESTROYED
+5. Workers boot, join, configured
+```
+
+### RHCOS + Ignition
+- **RHCOS** = immutable node OS (no SSH-config; declarative). **Ignition** = runs once at first boot (like cloud-init) → node auto-joins. Nodes = cattle, not pets.
+
+### ⭐ Machine API — nodes ARE K8s objects
+```
+MachineSet (CRD, like ReplicaSet for VMs) → Machine (CRD = one GCP VM)
+   machine-api-operator reconciles → calls GCP API to create/delete VM → VM boots RHCOS+Ignition → joins as Node
+```
+- **Machine** = one cloud VM as a K8s object; **MachineSet** = "keep N Machines" (= ReplicaSet for nodes). Scale MachineSet → autoscale nodes. Same reconciliation loop. (Saw `machine-api` webhook earlier.)
+```bash
+kubectl get machines -n openshift-machine-api
+kubectl get machinesets -n openshift-machine-api
+```
+
+### Day-2 operators
+- **CVO** (Cluster Version Operator): manages core operators + upgrades.
+- **MCO** (Machine Config Operator): manages RHCOS node config, rolls out node-by-node (drain→apply→reboot).
+- **cloud-controller-manager**: bridges to GCP (provisions LBs for Services, manages routes).
+
+> Soundbite: "OpenShift on GCP uses IPI: openshift-install calls the GCP API to build the VPC, subnets, firewalls, LBs, DNS, and VMs, then a temporary bootstrap node stands up the real control plane before self-destructing. Nodes run immutable RHCOS configured by Ignition. Post-install the Machine API manages cloud VMs as K8s objects — a MachineSet is a ReplicaSet for nodes — and operators (CVO, MCO, CCM) handle upgrades, OS config, and cloud integration. Kubernetes managing its own infrastructure with the same reconciliation pattern."
+
+### Machine API two-layer control (verified)
+- **MachineSet controller** = keeps N Machine objects (like ReplicaSet→Pods, count reconciliation).
+- **Machine controller** (provider-specific) = reconciles each Machine by **calling the GCP API** to create/delete the VM. It's the *kubelet-equivalent for infrastructure* (calls cloud API instead of CRI).
+- **MachineSets are per-zone** (a VM is zonal) → one MachineSet per role+zone (worker-a/b/c, infra-a/b/c) for even HA spread.
+- **`providerID`** on the Node = `gce://<project>/<zone>/<instance>` → the link between K8s Node and the real GCP VM (CCM uses it for LB backends, deletion).
+- **Instance type per MachineSet drives arch:** masters `c4a-highmem-4` (GCP Axion = **ARM/aarch64**); workers/infra `n2d`/`e2` (**x86_64**); kata `c3-standard-4`. This is WHY the cluster is mixed-arch. infra = `n2d-highmem-16` (big, runs monitoring/Loki).
+```bash
+kubectl get machines -n openshift-machine-api -o wide   # TYPE, ZONE, PROVIDERID
+kubectl get node <n> -o jsonpath='{.spec.providerID}{"\n"}'
+kubectl get nodes -L kubernetes.io/arch,node.kubernetes.io/instance-type
+```
+
+### Machine vs Node (2 objects, same VM) + deletion behavior
+- **Same VM = TWO objects:** **Machine** (infra/cloud view: instance type, zone) owned by Machine API; **Node** (runtime view: capacity, conditions, pods) registered by the kubelet. Linked by **`providerID`** (`gce://project/zone/instance`) present on both.
+- Analogy: `MachineSet : Machine : VM` ≈ `ReplicaSet : Pod : container`. A MachineSet is a ReplicaSet for VMs.
+- **`kubectl delete machine`** → Machine controller: cordon Node → **drain** (respects **PDBs** via a **finalizer**) → terminate GCP VM → delete Node → remove finalizer. Machine = authoritative infra lifecycle owner.
+  | Action | VM destroyed? | Node removed? | Net |
+  |--------|--------------|---------------|-----|
+  | delete machine (standalone) | ✅ | ✅ (drained) | node gone |
+  | delete machine (in MachineSet) | ✅ | ✅ | **replaced** (set reconciles → new VM/node) = node rotation/repair |
+  | delete node only | ❌ | temp | VM survives; Machine re-reconciles (Machine = source of truth) |
+  | delete machineset | ✅ all | ✅ all | whole node group gone |
+- **machine-health-check** operator automates repair: unhealthy Node → delete Machine → auto-replace.
