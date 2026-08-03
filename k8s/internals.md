@@ -49,7 +49,7 @@ kubectl get pods -n kube-system -o wide
 ```
 
 ### Observations (my sandbox = OpenShift, not vanilla K8s!)
-- Cluster is **OpenShift** on GCP: `api.sb0120.caas.gcp.ford.com:6443`, runtime `cri-o`, OS `RHCOS`.
+- Cluster is **OpenShift** on GCP: `api.sb0120.caas.gcp.<NAME>.com:6443`, runtime `cri-o`, OS `RHCOS`.
 - **16 nodes**: 3 control-plane/master + 13 workers.
 - Worker roles are specialized via **node labels**: `worker` (general), `infra` (routers/monitoring/registry), `el` (edge/egress), `kata` (VM-isolated pods).
 - **Mixed architecture**: masters are `aarch64` (ARM), workers are `x86_64`. Scheduling respects the `kubernetes.io/arch` label.
@@ -232,10 +232,10 @@ kubectl auth can-i create pods -n learn-k8s
     openID:
       clientID: 174845ca-...          # THIS CLUSTER's app registration in Azure AD
       clientSecret: {name: azure-ad-client-secret}  # cluster's OAuth app password (K8s Secret)
-      issuer: https://login.microsoftonline.com/<tenant-id>/v2.0   # tenant-id GUID = Ford Azure tenant; ROOT OF TRUST
+      issuer: https://login.microsoftonline.com/<tenant-id>/v2.0   # tenant-id GUID = <NAME> Azure tenant; ROOT OF TRUST
       extraScopes: [email, profile]   # request extra claims
       claims:
-        preferredUsername: [upn]      # username = upn (e.g. psupraja@ford.com)
+        preferredUsername: [upn]      # username = upn (e.g. supraja@<NAME>.com)
         email: [email]
         name: [name]
   ```
@@ -339,7 +339,7 @@ Then `export GOOGLE_APPLICATION_CREDENTIALS=<file>` → Google SDK auto-discover
   resource "google_service_account_iam_member" "tekton_wif" {
     service_account_id = google_service_account.gsa_tekton_service.id   # GSA to impersonate
     role   = "roles/iam.workloadIdentityUser"                          # trust/impersonation role
-    member = "principal://iam.googleapis.com/projects/110453944286/locations/global/workloadIdentityPools/openshift-pool/subject/system:serviceaccount:openshift-ford-artifacthub:artifacthub"
+    member = "principal://iam.googleapis.com/projects/110453944286/locations/global/workloadIdentityPools/openshift-pool/subject/system:serviceaccount:openshift-<NAME>-artifacthub:artifacthub"
   }
   ```
   - `workloadIdentityPools/openshift-pool` = the pool (registered with cluster issuer-uri at setup).
@@ -368,7 +368,7 @@ kubectl get credentialsrequests -A | head ; kubectl -n openshift-cloud-credentia
 
 ### Policy engines: OPA Gatekeeper vs Kyverno (admission)
 - **OPA** (Open Policy Agent) = general policy engine, **Rego** language. **Gatekeeper** = OPA as a K8s **validating (+mutating) admission webhook** (CRDs: **ConstraintTemplate** = Rego rule, **Constraint** = instance).
-- Enforces at admission (stage 6): "images only from registry.ford.com", "require labels", "no privileged". Rejects non-compliant objects.
+- Enforces at admission (stage 6): "images only from registry.<NAME>.com", "require labels", "no privileged". Rejects non-compliant objects.
 - **Gatekeeper (Rego) vs Kyverno (YAML):** same job (policy-as-admission), different language. This cluster uses **Kyverno**. Both = CRD + webhook + operator.
 
 ### How operators get installed — OLM (Operator Lifecycle Manager)
@@ -895,7 +895,7 @@ kubectl -n openshift-logging logs logging-loki-compactor-0 --tail=20   # debug t
 - **Pull vs push (why):** metrics = sampled **state** → pull (Prometheus scrape; doubles as health-check + discovery). logs/traces = ephemeral **events** (gone if not captured) → push the instant they happen.
 - **Full picture:** metrics=pull(/metrics→Prometheus); logs=push(Vector→Loki); traces=push(OTel SDK→collector→Tempo/Dynatrace).
 ```bash
-kubectl -n openshift-ford-cluster-collectors get opentelemetrycollector otel -o yaml | grep -A30 'config:'
+kubectl -n openshift-<NAME>-cluster-collectors get opentelemetrycollector otel -o yaml | grep -A30 'config:'
 kubectl get instrumentations -A ; kubectl get dynakube -A 2>/dev/null
 kubectl get pods -A | grep -iE 'tempo|dynatrace'
 ```
