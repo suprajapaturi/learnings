@@ -222,8 +222,8 @@ Automates request + store + **auto-renew** (default at 2/3 of lifetime). No more
 ### Venafi (our setup)
 - **Venafi** = enterprise cert-lifecycle / machine-identity platform = **policy gateway in front of the corporate CA** (DigiCert/MS CA). Enterprises don't use public Let's Encrypt internally.
 - Venafi enforces org PKI **policy**: approved CAs, allowed domains/SANs, key size/algo, validity, audit/inventory.
-- **Two flavors:** **TPP** (Trust Protection Platform, on-prem — typical Ford) uses `url`+`zone`+token; **Venafi Cloud** (VaaS) uses `zone`+API key.
-- Config (TPP): `spec.venafi.zone: "Ford\\Platform\\OpenShift"` (policy folder) + `tpp.url` + `credentialsRef` (Secret w/ access token). Certificate references this ClusterIssuer → cert-manager calls Venafi → policy applied → corp-CA-signed cert into Secret.
+- **Two flavors:** **TPP** (Trust Protection Platform, on-prem — typical <NAME>) uses `url`+`zone`+token; **Venafi Cloud** (VaaS) uses `zone`+API key.
+- Config (TPP): `spec.venafi.zone: "<NAME>\\Platform\\OpenShift"` (policy folder) + `tpp.url` + `credentialsRef` (Secret w/ access token). Certificate references this ClusterIssuer → cert-manager calls Venafi → policy applied → corp-CA-signed cert into Secret.
 
 ### ⭐ Venafi issuer needs NO ACME challenge
 | | **ACME** (Let's Encrypt) | **Venafi** |
@@ -258,20 +258,20 @@ Automates request + store + **auto-renew** (default at 2/3 of lifetime). No more
 - **Dependency ladder:** OLM→cert-manager operator (Certificate CRD) · OLM/Helm→Venafi issuer (VenafiClusterIssuer CRD + `standard-venafi-issuer` instance→Venafi TPP) · app repo's Certificate CR references it→Secret. Likely **Argo CD applies the Subscriptions** (GitOps).
 - **Verify:** `oc get csv -A | grep -iE 'cert-manager|venafi'` · `oc get subscription -A` · `oc get crd | grep -iE 'cert-manager.io|jetstack.io'` · `oc get pods -n cert-manager`.
 
-### Annotated real Ford Certificate CR (this is a CR, not the CRD)
+### Annotated real <NAME> Certificate CR (this is a CR, not the CRD)
 ```yaml
 kind: Certificate                    # instance of certificates.cert-manager.io CRD
 spec:
   secretName: tls-cert-<app>         # OUTPUT Secret (tls.crt+tls.key) the Route presents
   secretTemplate:
-    annotations: {kyverno.ford.com/reload: "allow"}  # Kyverno restarts pods on rotation (Reloader-style)
+    annotations: {kyverno.<NAME>.com/reload: "allow"}  # Kyverno restarts pods on rotation (Reloader-style)
   duration: 8760h                    # 365d validity (Venafi zone must allow)
   renewBefore: 2160h                 # renew 90d early → auto-renew at day 275
   privateKey: {rotationPolicy: Always}   # NEW keypair each renewal (stronger than Never/reuse)
   commonName / dnsNames: patchme     # placeholders → real hostname patched by cldctl at deploy
   issuerRef: {name: standard-venafi-issuer, kind: VenafiClusterIssuer, group: jetstack.io}  # Venafi Enhanced Issuer
 ```
-- `{{.cleanedAppName}}` etc = **Go-template rendered by Ford `cldctl`** (label `renderedBy: cldctlVersion`); file in Git is a template, applied object is rendered.
+- `{{.cleanedAppName}}` etc = **Go-template rendered by <NAME> `cldctl`** (label `renderedBy: cldctlVersion`); file in Git is a template, applied object is rendered.
 - `patchme` = placeholder swapped for real `*.apps` host per app.
 
 ---
@@ -384,6 +384,6 @@ Same OIDC federation as IRSA/WIF:
 ⭐ **image build repo ≠ deploy config repo.** CI commits new image tag to the **config repo**; Argo watches config repo (app churn ≠ deploy spam; config repo = audited desired state).
 
 ### 🔁 Alternatives
-GitHub Actions (JD) · GitLab CI · Jenkins · **Tekton = OpenShift Pipelines** (Ford may use). Registry: ECR/Quay/Artifact Registry. Cloud auth = OIDC (no keys).
+GitHub Actions (JD) · GitLab CI · Jenkins · **Tekton = OpenShift Pipelines** (<NAME> may use). Registry: ECR/Quay/Artifact Registry. Cloud auth = OIDC (no keys).
 
 > CI/CD soundbite: "CI and CD split at Git: GitHub Actions builds, tests, scans, pushes the image, then commits the new tag to the config repo — it never touches the cluster. Argo CD pulls from that repo and Rollouts does the progressive release. GitHub Actions authenticates to AWS via OIDC not stored keys — same federation as IRSA — an IAM Role trusts the GitHub OIDC provider scoped to repo and branch. That push-CI/pull-CD boundary makes GitOps auditable and keeps cluster creds out of CI."
