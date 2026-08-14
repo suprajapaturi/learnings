@@ -49,7 +49,7 @@ kubectl get pods -n kube-system -o wide
 ```
 
 ### Observations (my sandbox = OpenShift, not vanilla K8s!)
-- Cluster is **OpenShift** on GCP: `api.sb0120.caas.gcp.<NAME>.com:6443`, runtime `cri-o`, OS `RHCOS`.
+- Cluster is **OpenShift** on GCP: `api.<cluster>.example.com:6443`, runtime `cri-o`, OS `RHCOS`.
 - **16 nodes**: 3 control-plane/master + 13 workers.
 - Worker roles are specialized via **node labels**: `worker` (general), `infra` (routers/monitoring/registry), `el` (edge/egress), `kata` (VM-isolated pods).
 - **Mixed architecture**: masters are `aarch64` (ARM), workers are `x86_64`. Scheduling respects the `kubernetes.io/arch` label.
@@ -230,12 +230,12 @@ kubectl auth can-i create pods -n learn-k8s
     type: OpenID
     mappingMethod: claim              # create/link OpenShift User by preferred username; fail on collision
     openID:
-      clientID: 174845ca-...          # THIS CLUSTER's app registration in Azure AD
+      clientID: <client-id>          # THIS CLUSTER's app registration in Azure AD
       clientSecret: {name: azure-ad-client-secret}  # cluster's OAuth app password (K8s Secret)
-      issuer: https://login.microsoftonline.com/<tenant-id>/v2.0   # tenant-id GUID = <NAME> Azure tenant; ROOT OF TRUST
+      issuer: https://login.microsoftonline.com/<tenant-id>/v2.0   # tenant-id GUID = the org's Azure tenant; ROOT OF TRUST
       extraScopes: [email, profile]   # request extra claims
       claims:
-        preferredUsername: [upn]      # username = upn (e.g. supraja@<NAME>.com)
+        preferredUsername: [upn]      # username = upn (e.g. user@example.com)
         email: [email]
         name: [name]
   ```
@@ -339,7 +339,7 @@ Then `export GOOGLE_APPLICATION_CREDENTIALS=<file>` → Google SDK auto-discover
   resource "google_service_account_iam_member" "tekton_wif" {
     service_account_id = google_service_account.gsa_tekton_service.id   # GSA to impersonate
     role   = "roles/iam.workloadIdentityUser"                          # trust/impersonation role
-    member = "principal://iam.googleapis.com/projects/110453944286/locations/global/workloadIdentityPools/openshift-pool/subject/system:serviceaccount:openshift-<NAME>-artifacthub:artifacthub"
+    member = "principal://iam.googleapis.com/projects/<project-number>/locations/global/workloadIdentityPools/openshift-pool/subject/system:serviceaccount:<namespace>:<serviceaccount>"
   }
   ```
   - `workloadIdentityPools/openshift-pool` = the pool (registered with cluster issuer-uri at setup).
@@ -348,7 +348,7 @@ Then `export GOOGLE_APPLICATION_CREDENTIALS=<file>` → Google SDK auto-discover
 > Triple soundbite: "Workload identity trust is always three coordinates: issuer (who signs = the cluster's OIDC issuer URL, used at registration), subject (which ServiceAccount = system:serviceaccount:ns:sa), and audience (for whom = the pool/app). The pod only carries a token + audience at runtime; the issuer is registered once on the relying party — Azure federated credential, GCP workload identity pool, AWS OIDC provider, or FOSSA."
 
 #### How WIF is ENABLED on an OpenShift cluster (CCO + ccoctl)
-- **There IS a serviceAccountIssuer** — it must be a **PUBLIC OIDC issuer** (so GCP can fetch the JWKS). On OpenShift-GCP-WIF it's usually a **public GCS bucket**: `https://storage.googleapis.com/<bucket>` hosting `/.well-known/openid-configuration` + `/keys` (JWKS). Bound SA tokens carry `iss` = that URL; the WIF pool provider's `--issuer-uri` = that URL. (Not the internal `api.sb0120...`.)
+- **There IS a serviceAccountIssuer** — it must be a **PUBLIC OIDC issuer** (so GCP can fetch the JWKS). On OpenShift-GCP-WIF it's usually a **public GCS bucket**: `https://storage.googleapis.com/<bucket>` hosting `/.well-known/openid-configuration` + `/keys` (JWKS). Bound SA tokens carry `iss` = that URL; the WIF pool provider's `--issuer-uri` = that URL. (Not the internal `api.<cluster>...`.)
 - **Engine = Cloud Credential Operator (CCO)** in **Manual + short-lived (WIF) mode** — set at INSTALL time (`credentialsMode: Manual` in install-config; can't easily flip on a running cluster).
 - **`ccoctl gcp create-all`** automates the GCP side: creates the **public GCS bucket** (→ becomes the issuer URL), the **Workload Identity Pool + OIDC provider** (`issuer-uri`=bucket), the **GSAs + iam.workloadIdentityUser bindings** (the Terraform members), and the **external_account Secret manifests**.
 - **CredentialsRequest** CRs (from each operator needing cloud access) → CCO fulfills them → creates the `external_account` Secret (projected token + STS + GSA impersonation URL — the pod config seen).
@@ -368,7 +368,7 @@ kubectl get credentialsrequests -A | head ; kubectl -n openshift-cloud-credentia
 
 ### Policy engines: OPA Gatekeeper vs Kyverno (admission)
 - **OPA** (Open Policy Agent) = general policy engine, **Rego** language. **Gatekeeper** = OPA as a K8s **validating (+mutating) admission webhook** (CRDs: **ConstraintTemplate** = Rego rule, **Constraint** = instance).
-- Enforces at admission (stage 6): "images only from registry.<NAME>.com", "require labels", "no privileged". Rejects non-compliant objects.
+- Enforces at admission (stage 6): "images only from registry.example.com", "require labels", "no privileged". Rejects non-compliant objects.
 - **Gatekeeper (Rego) vs Kyverno (YAML):** same job (policy-as-admission), different language. This cluster uses **Kyverno**. Both = CRD + webhook + operator.
 
 ### How operators get installed — OLM (Operator Lifecycle Manager)
@@ -438,12 +438,12 @@ kubectl -n openshift-logging get statefulset logging-loki-ingester -o jsonpath='
 - Vanilla/kubeadm uses `/registry/...`; **OpenShift sets `--etcd-prefix=/kubernetes.io`** → keys like `/kubernetes.io/pods/<ns>/<name>`. Live proof the prefix is API-server-owned + configurable.
 - **CONFIRMED LIVE** (etcdctl inside etcd pod):
   ```
-  /kubernetes.io/pods/cloudtooling-fuzzyhub/fuzzyhub-resolver-5f5ffdd7cb-62jch
-  /kubernetes.io/pods/cloudtooling/psql-client
+  /kubernetes.io/pods/<namespace>/<pod-name>
+  /kubernetes.io/pods/<namespace>/<pod-name>
   ```
   Same object via API server REST (JSON, note resourceVersion + OVN annotation):
   ```
-  kubectl get --raw "/api/v1/namespaces/cloudtooling/pods/psql-client"
+  kubectl get --raw "/api/v1/namespaces/<namespace>/pods/<pod-name>"
   → metadata.resourceVersion=1550838611 (huge → global counter, cluster-wide writes)
   → annotation k8s.ovn.org/pod-networks = pod IP 172.24.15.214/24, mac, gateway (OVN-assigned; see networking lesson)
   ```
@@ -895,7 +895,7 @@ kubectl -n openshift-logging logs logging-loki-compactor-0 --tail=20   # debug t
 - **Pull vs push (why):** metrics = sampled **state** → pull (Prometheus scrape; doubles as health-check + discovery). logs/traces = ephemeral **events** (gone if not captured) → push the instant they happen.
 - **Full picture:** metrics=pull(/metrics→Prometheus); logs=push(Vector→Loki); traces=push(OTel SDK→collector→Tempo/Dynatrace).
 ```bash
-kubectl -n openshift-<NAME>-cluster-collectors get opentelemetrycollector otel -o yaml | grep -A30 'config:'
+kubectl -n openshift-cluster-collectors get opentelemetrycollector otel -o yaml | grep -A30 'config:'
 kubectl get instrumentations -A ; kubectl get dynakube -A 2>/dev/null
 kubectl get pods -A | grep -iE 'tempo|dynatrace'
 ```
@@ -1166,7 +1166,7 @@ kubectl get runtimeclass                            # kata etc.
 ### Install flow (`openshift-install create cluster`)
 1. Reads **`install-config.yaml`** (region, node counts, machine types, base domain, GCP project, pull secret).
 2. Generates **Ignition** configs (RHCOS first-boot config) per role: bootstrap/master/worker.
-3. Calls **GCP API** → creates VPC, subnets (10.0.144.0/x node net), firewall rules (6443 API, 22623 machine-config), Cloud LBs (API + ingress), Cloud DNS (`api.sb0120...` → LB), IAM service accounts, VM instances.
+3. Calls **GCP API** → creates VPC, subnets (10.0.144.0/x node net), firewall rules (6443 API, 22623 machine-config), Cloud LBs (API + ingress), Cloud DNS (`api.<cluster>...` → LB), IAM service accounts, VM instances.
 4. **Bootstrap process** → destroys bootstrap → operators finish config.
 
 ### Bootstrap (chicken-and-egg solve)
